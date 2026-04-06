@@ -1,0 +1,30 @@
+{
+  "name": "ai-bridge",
+  "title": "AI Bridge",
+  "description": "Bridge Raycast AI to CLI via file-based IPC",
+  "icon": "command-icon.png",
+  "author": "seancrooks",
+  "categories": ["Developer Tools"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "ai-bridge",
+      "title": "AI Bridge",
+      "description": "Watches for AI requests and returns responses via file IPC",
+      "mode": "no-view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "typescript": "^5.4.0",
+    "@types/node": "~22.0.0"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}

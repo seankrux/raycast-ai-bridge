@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# rayai — CLI wrapper for Raycast AI Bridge
+# Usage:
+#   rayai "your prompt here"
+#   rayai -m claude-4.6-opus "your prompt"
+#   rayai -m gemini-3.1-pro -c 0.8 "creative prompt"
+#   rayai --models                    # list available models
+#   rayai --stream "your prompt"      # show output as it streams
+
+set -euo pipefail
+
+BRIDGE_DIR="$HOME/.raycast-ai-bridge"
+REQUEST_FILE="$BRIDGE_DIR/request.json"
+RESPONSE_FILE="$BRIDGE_DIR/response.json"
+STREAM_FILE="$BRIDGE_DIR/stream.txt"
+MODELS_FILE="$BRIDGE_DIR/models.json"
+
+MODEL="gpt-4o"
+CREATIVITY=0.5
+SYSTEM=""
+STREAM=false
+TIMEOUT=120
+
+mkdir -p "$BRIDGE_DIR"
+
+usage() {
+  cat <<'EOF'
+rayai — Raycast AI from your terminal
+
+USAGE:
+  rayai [OPTIONS] "your prompt"
+  echo "prompt" | rayai [OPTIONS]
+
+OPTIONS:
+  -m, --model MODEL     Model to use (default: gpt-4o)
+  -c, --creativity N    0-2, default 0.5
+  -s, --system TEXT     System instruction
+  --stream              Show streaming output
+  --models              List available models
+  --timeout N           Timeout in seconds (default: 120)
+  -h, --help            Show this help
+
+MODELS (partial list):
+  gpt-4o, gpt-5, claude-4.6-opus, claude-4.6-sonnet,
+  gemini-3.1-pro, grok-4, deepseek-r1, codestral,
+  sonar-pro, llama-4-scout, qwen3-235b
+
+  Run 'rayai --models' for the full list.
+
+SETUP:
+  1. cd to the ai-bridge extension directory
+  2. npm install && npm run dev
+  3. The extension runs inside Raycast with valid AI access
+
+EOF
+  exit 0
+}
+
+list_models() {
+  if [[ -f "$MODELS_FILE" ]]; then
+    echo "Available models:"
+    python3 -c "
+import json
+models = json.load(open('$MODELS_FILE'))
+for m in sorted(models):
+    print(f'  {m}')
+"
+  else
+    echo "Models file not found. Run the Raycast AI Bridge extension first."
+  fi
+  exit 0
+}
+
+# Parse arguments
+PROMPT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) MODEL="$2"; shift 2 ;;
+    -c|--creativity) CREATIVITY="$2"; shift 2 ;;
+    -s|--system) SYSTEM="$2"; shift 2 ;;
+    --stream) STREAM=true; shift ;;
+    --models) list_models ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+
+# Read from stdin if no prompt argument
+if [[ -z "$PROMPT" ]]; then
+  if [[ -t 0 ]]; then
+    echo "Error: No prompt provided. Use 'rayai \"your prompt\"' or pipe input." >&2
+    exit 1
+  fi
+  PROMPT="$(cat)"
+fi
+
+# Generate unique request ID
+REQUEST_ID="req_$(date +%s)_$$"
+
+# Clean up old response files
+rm -f "$RESPONSE_FILE" "$STREAM_FILE"
+
+# Build request JSON safely using env vars (no shell interpolation issues)
+REQUEST_ID="$REQUEST_ID" PROMPT="$PROMPT" MODEL="$MODEL" CREATIVITY="$CREATIVITY" SYSTEM="$SYSTEM" python3 -c "
+import json, os
+req = {
+    'id': os.environ['REQUEST_ID'],
+    'prompt': os.environ['PROMPT'],
+    'model': os.environ['MODEL'],
+    'creativity': float(os.environ['CREATIVITY']),
+}
+system = os.environ.get('SYSTEM', '')
+if system:
+    req['system'] = system
+print(json.dumps(req, indent=2))
+" > "$REQUEST_FILE"
+
+# Trigger the Raycast extension via deeplink (background, no focus steal)
+open -g "raycast://extensions/seancrooks/ai-bridge/ai-bridge"
+
+# Wait for response
+elapsed=0
+if [[ "$STREAM" == true ]]; then
+  # Streaming mode: tail the stream file
+  last_size=0
+  while [[ $elapsed -lt $TIMEOUT ]]; do
+    if [[ -f "$STREAM_FILE" ]]; then
+      current_size=$(wc -c < "$STREAM_FILE" 2>/dev/null || echo 0)
+      if [[ $current_size -gt $last_size ]]; then
+        # Print new content
+        tail -c +$((last_size + 1)) "$STREAM_FILE"
+        last_size=$current_size
+      fi
+    fi
+    if [[ -f "$RESPONSE_FILE" ]]; then
+      # Final response arrived — print any remaining stream content
+      if [[ -f "$STREAM_FILE" ]]; then
+        current_size=$(wc -c < "$STREAM_FILE" 2>/dev/null || echo 0)
+        if [[ $current_size -gt $last_size ]]; then
+          tail -c +$((last_size + 1)) "$STREAM_FILE"
+        fi
+      fi
+      echo ""
+      # Check for errors
+      error=$(python3 -c "import json; r=json.load(open('$RESPONSE_FILE')); print(r.get('error',''))" 2>/dev/null)
+      if [[ -n "$error" ]]; then
+        echo "Error: $error" >&2
+        rm -f "$RESPONSE_FILE" "$STREAM_FILE"
+        exit 1
+      fi
+      rm -f "$RESPONSE_FILE" "$STREAM_FILE"
+      exit 0
+    fi
+    sleep 0.3
+    elapsed=$((elapsed + 1))
+  done
+else
+  # Non-streaming: wait for response file
+  while [[ $elapsed -lt $TIMEOUT ]]; do
+    if [[ -f "$RESPONSE_FILE" ]]; then
+      error=$(python3 -c "import json; r=json.load(open('$RESPONSE_FILE')); print(r.get('error',''))" 2>/dev/null)
+      if [[ -n "$error" ]]; then
+        echo "Error: $error" >&2
+        rm -f "$RESPONSE_FILE" "$STREAM_FILE"
+        exit 1
+      fi
+      python3 -c "import json; print(json.load(open('$RESPONSE_FILE'))['content'])"
+      rm -f "$RESPONSE_FILE" "$STREAM_FILE"
+      exit 0
+    fi
+    sleep 0.5
+    elapsed=$((elapsed + 1))
+  done
+fi
+
+echo "Error: Timeout waiting for response (${TIMEOUT}s). Is the Raycast AI Bridge extension running?" >&2
+rm -f "$REQUEST_FILE"
+exit 1

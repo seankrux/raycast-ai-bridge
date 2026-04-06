@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+rayai-server — OpenAI-compatible API server backed by Raycast AI Bridge.
+
+Exposes:
+  GET  /v1/models
+  POST /v1/chat/completions
+  GET  /health
+
+Usage:
+  rayai-server                    # starts on port 8080
+  rayai-server --port 9000        # custom port
+  rayai-server --api-key mysecret # require auth
+"""
+
+import json
+import os
+import sys
+import time
+import uuid
+import subprocess
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+BRIDGE_DIR = Path.home() / ".raycast-ai-bridge"
+REQUEST_FILE = BRIDGE_DIR / "request.json"
+RESPONSE_FILE = BRIDGE_DIR / "response.json"
+STREAM_FILE = BRIDGE_DIR / "stream.txt"
+MODELS_FILE = BRIDGE_DIR / "models.json"
+
+API_KEY = None
+TIMEOUT = 120
+
+
+def load_models():
+    if MODELS_FILE.exists():
+        return json.loads(MODELS_FILE.read_text())
+    return []
+
+
+def trigger_raycast():
+    subprocess.Popen(
+        ["open", "-g", "raycast://extensions/seancrooks/ai-bridge/ai-bridge"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_response(timeout=TIMEOUT):
+    elapsed = 0
+    while elapsed < timeout:
+        if RESPONSE_FILE.exists():
+            data = json.loads(RESPONSE_FILE.read_text())
+            RESPONSE_FILE.unlink(missing_ok=True)
+            STREAM_FILE.unlink(missing_ok=True)
+            return data
+        time.sleep(0.3)
+        elapsed += 1
+    return None
+
+
+class RayAIHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {args[0]}")
+
+    def send_json(self, code, data):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def check_auth(self):
+        if not API_KEY:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:] == API_KEY:
+            return True
+        self.send_json(401, {"error": {"message": "Invalid API key", "type": "authentication_error"}})
+        return False
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
+
+    def do_GET(self):
+        if not self.check_auth():
+            return
+
+        if self.path == "/health":
+            self.send_json(200, {"status": "ok"})
+
+        elif self.path == "/v1/models":
+            models = load_models()
+            data = {
+                "object": "list",
+                "data": [
+                    {"id": m, "object": "model", "created": int(time.time()), "owned_by": "raycast-pro"}
+                    for m in sorted(models)
+                ],
+            }
+            self.send_json(200, data)
+
+        else:
+            self.send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
+
+    def do_POST(self):
+        if not self.check_auth():
+            return
+
+        if self.path != "/v1/chat/completions":
+            self.send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(content_length))
+
+        messages = body.get("messages", [])
+        model = body.get("model", "gpt-4o")
+        temperature = body.get("temperature", 0.5)
+        stream = body.get("stream", False)
+
+        if not messages:
+            self.send_json(400, {"error": {"message": "Missing messages", "type": "invalid_request_error"}})
+            return
+
+        # Extract system message and user messages
+        system_text = ""
+        prompt_parts = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+            elif msg["role"] == "user":
+                prompt_parts.append(msg["content"])
+            elif msg["role"] == "assistant":
+                prompt_parts.append(f"[Assistant]: {msg['content']}")
+
+        prompt = "\n\n".join(prompt_parts)
+        request_id = f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+        # Map temperature (OpenAI 0-2) to creativity (Raycast 0-2)
+        creativity = max(0, min(2, temperature))
+
+        # Write request
+        RESPONSE_FILE.unlink(missing_ok=True)
+        STREAM_FILE.unlink(missing_ok=True)
+
+        req = {"id": request_id, "prompt": prompt, "model": model, "creativity": creativity}
+        if system_text:
+            req["system"] = system_text
+        REQUEST_FILE.write_text(json.dumps(req, indent=2))
+
+        # Trigger Raycast
+        trigger_raycast()
+
+        chatcmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            last_len = 0
+            elapsed = 0
+            while elapsed < TIMEOUT:
+                if STREAM_FILE.exists():
+                    content = STREAM_FILE.read_text()
+                    if len(content) > last_len:
+                        new_text = content[last_len:]
+                        last_len = len(content)
+                        chunk = {
+                            "id": chatcmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": new_text}, "finish_reason": None}],
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        self.wfile.flush()
+
+                if RESPONSE_FILE.exists():
+                    # Send any remaining stream content
+                    if STREAM_FILE.exists():
+                        content = STREAM_FILE.read_text()
+                        if len(content) > last_len:
+                            new_text = content[last_len:]
+                            chunk = {
+                                "id": chatcmpl_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": new_text}, "finish_reason": None}],
+                            }
+                            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                            self.wfile.flush()
+
+                    # Send finish chunk
+                    done_chunk = {
+                        "id": chatcmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    self.wfile.write(f"data: {json.dumps(done_chunk)}\n\ndata: [DONE]\n\n".encode())
+                    self.wfile.flush()
+                    RESPONSE_FILE.unlink(missing_ok=True)
+                    STREAM_FILE.unlink(missing_ok=True)
+                    return
+
+                time.sleep(0.2)
+                elapsed += 1
+
+            # Timeout
+            err_chunk = {
+                "id": chatcmpl_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": "[Timeout]"}, "finish_reason": "stop"}],
+            }
+            self.wfile.write(f"data: {json.dumps(err_chunk)}\n\ndata: [DONE]\n\n".encode())
+            self.wfile.flush()
+        else:
+            # Non-streaming
+            resp = wait_for_response()
+            if resp is None:
+                self.send_json(504, {"error": {"message": "Timeout waiting for Raycast", "type": "relay_error"}})
+                return
+
+            if resp.get("error"):
+                self.send_json(500, {"error": {"message": resp["error"], "type": "relay_error"}})
+                return
+
+            openai_resp = {
+                "id": chatcmpl_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": resp["content"]},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+            self.send_json(200, openai_resp)
+
+
+def main():
+    global API_KEY, TIMEOUT
+
+    parser = argparse.ArgumentParser(description="OpenAI-compatible server for Raycast AI")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--api-key", default=os.environ.get("RAYAI_API_KEY", ""))
+    parser.add_argument("--timeout", type=int, default=120)
+    args = parser.parse_args()
+
+    API_KEY = args.api_key or None
+    TIMEOUT = args.timeout
+
+    BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    server = HTTPServer((args.host, args.port), RayAIHandler)
+    print(f"rayai-server running on http://{args.host}:{args.port}")
+    print(f"  POST /v1/chat/completions")
+    print(f"  GET  /v1/models")
+    print(f"  Auth: {'required' if API_KEY else 'none'}")
+    print(f"  Timeout: {TIMEOUT}s")
+    print()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
