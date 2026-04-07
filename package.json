@@ -17,10 +17,11 @@
     },
     {
       "name": "process",
-      "title": "AI Bridge — Process Request",
-      "description": "Processes a pending AI request from the HTTP server. Triggered automatically via deep link.",
-      "mode": "no-view",
-      "icon": "command-icon.png"
+      "title": "AI Bridge — Background",
+      "description": "Runs silently in the menu bar, processing AI requests in the background. No window activation.",
+      "mode": "menu-bar",
+      "icon": "command-icon.png",
+      "interval": "10m"
     }
   ],
   "preferences": [

@@ -14,10 +14,11 @@ import {
   showToast,
 } from "@raycast/api";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { spawn } from "child_process";
+import { execSync, spawn } from "child_process";
+import http from "http";
 import { SERVER_SCRIPT } from "./server-template";
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
@@ -27,65 +28,73 @@ const SERVER_JS           = join(BRIDGE_DIR, "server.js");
 const SELECTED_MODELS_FILE = join(BRIDGE_DIR, "selected-models.json");
 const AVAILABLE_MODELS_FILE = join(BRIDGE_DIR, "available-models.json");
 
-// ─── All known Raycast AI model IDs grouped by provider ───────────────────────
-// key = AI.Model-compatible string value, value = display label
-const MODEL_CATALOG: Record<string, { label: string; provider: string }> = {
-  // OpenAI
-  "openai-gpt-4o"        : { label: "GPT-4o",          provider: "OpenAI" },
-  "openai-gpt-4o-mini"   : { label: "GPT-4o Mini",      provider: "OpenAI" },
-  "openai-gpt-4.1"       : { label: "GPT-4.1",          provider: "OpenAI" },
-  "openai-gpt-4.1-mini"  : { label: "GPT-4.1 Mini",     provider: "OpenAI" },
-  "openai-gpt-4.1-nano"  : { label: "GPT-4.1 Nano",     provider: "OpenAI" },
-  "openai_o1-o1"         : { label: "o1",               provider: "OpenAI" },
-  "openai_o1-o3"         : { label: "o3",               provider: "OpenAI" },
-  "openai_o1-o3-mini"    : { label: "o3-mini",          provider: "OpenAI" },
-  "openai_o1-o4-mini"    : { label: "o4-mini",          provider: "OpenAI" },
-  // Anthropic
-  "anthropic-claude-haiku-3-5" : { label: "Claude 3.5 Haiku",   provider: "Anthropic" },
-  "anthropic-claude-sonnet-3-5": { label: "Claude 3.5 Sonnet",  provider: "Anthropic" },
-  "anthropic-claude-sonnet-4"  : { label: "Claude Sonnet 4",    provider: "Anthropic" },
-  "anthropic-claude-sonnet-4-5": { label: "Claude 4.5 Sonnet",  provider: "Anthropic" },
-  "anthropic-claude-sonnet-4-6": { label: "Claude 4.6 Sonnet",  provider: "Anthropic" },
-  "anthropic-claude-opus-4"    : { label: "Claude Opus 4",      provider: "Anthropic" },
-  "anthropic-claude-opus-4-5"  : { label: "Claude 4.5 Opus",    provider: "Anthropic" },
-  "anthropic-claude-opus-4-6"  : { label: "Claude 4.6 Opus",    provider: "Anthropic" },
-  // Google
-  "google-gemini-2.0-flash"      : { label: "Gemini 2.0 Flash",     provider: "Google" },
-  "google-gemini-2.5-flash"      : { label: "Gemini 2.5 Flash",     provider: "Google" },
-  "google-gemini-2.5-flash-lite" : { label: "Gemini 2.5 Flash Lite",provider: "Google" },
-  "google-gemini-2.5-pro"        : { label: "Gemini 2.5 Pro",       provider: "Google" },
-  // xAI
-  "xai-grok-3"          : { label: "Grok 3 Beta",   provider: "xAI" },
-  "xai-grok-3-mini"     : { label: "Grok 3 Mini",   provider: "xAI" },
-  "xai-grok-4"          : { label: "Grok 4",        provider: "xAI" },
-  "xai-grok-4-fast"     : { label: "Grok 4 Fast",   provider: "xAI" },
-  // Mistral
-  "mistral-codestral-latest"      : { label: "Codestral",      provider: "Mistral" },
-  "mistral-mistral-large-latest"  : { label: "Mistral Large",  provider: "Mistral" },
-  "mistral-mistral-medium-latest" : { label: "Mistral Medium", provider: "Mistral" },
-  "mistral-mistral-small-latest"  : { label: "Mistral Small",  provider: "Mistral" },
-  // Together AI
-  "together-deepseek-ai/DeepSeek-R1"   : { label: "DeepSeek R1",  provider: "Together AI" },
-  "together-deepseek-ai/DeepSeek-V3"   : { label: "DeepSeek V3",  provider: "Together AI" },
-  "together-moonshotai/Kimi-K2.5"      : { label: "Kimi K2.5",    provider: "Together AI" },
-  // Perplexity
-  "perplexity-sonar"     : { label: "Sonar",     provider: "Perplexity" },
-  "perplexity-sonar-pro" : { label: "Sonar Pro", provider: "Perplexity" },
-  // Groq
-  "groq-llama-3.3-70b-versatile"                        : { label: "Llama 3.3 70B",   provider: "Groq" },
-  "groq-llama-3.1-8b-instant"                           : { label: "Llama 3.1 8B",    provider: "Groq" },
-  "groq-meta-llama/llama-4-scout-17b-16e-instruct"      : { label: "Llama 4 Scout",   provider: "Groq" },
-  "groq-moonshotai/kimi-k2-instruct"                    : { label: "Kimi K2",         provider: "Groq" },
-  "groq-qwen/qwen3-32b"                                 : { label: "Qwen 3 32B",      provider: "Groq" },
-};
+// ─── Auto-discover all Raycast AI models from the API enum ───────────────────
+// AI.Model is a TypeScript enum — at runtime Object.values gives all model ID strings.
+// We derive provider and display label from the ID so nothing goes stale.
 
-const ALL_MODEL_IDS = Object.keys(MODEL_CATALOG);
-const PROVIDERS = [...new Set(Object.values(MODEL_CATALOG).map((m) => m.provider))];
+const PROVIDER_PREFIXES: [string, string][] = [
+  ["openai_o1-",   "OpenAI"],
+  ["openai-",      "OpenAI"],
+  ["anthropic-",   "Anthropic"],
+  ["google-",      "Google"],
+  ["xai-",         "xAI"],
+  ["mistral-",     "Mistral"],
+  ["together-",    "Together AI"],
+  ["perplexity-",  "Perplexity"],
+  ["groq-",        "Groq"],
+];
+
+function detectProvider(id: string): string {
+  for (const [prefix, name] of PROVIDER_PREFIXES) {
+    if (id.startsWith(prefix)) return name;
+  }
+  return "Other";
+}
+
+function makeLabel(id: string): string {
+  // Strip provider prefix to get the model name portion
+  for (const [prefix] of PROVIDER_PREFIXES) {
+    if (id.startsWith(prefix)) {
+      let name = id.slice(prefix.length);
+      // Clean up common patterns
+      name = name.replace(/-latest$/, "");
+      name = name.replace(/-versatile$/, "");
+      name = name.replace(/-instant$/, "");
+      // Remove org prefix for together/groq models (e.g. "deepseek-ai/DeepSeek-R1" → "DeepSeek-R1")
+      if (name.includes("/")) name = name.split("/").pop()!;
+      // Title-case words separated by hyphens
+      return name
+        .split("-")
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+    }
+  }
+  return id;
+}
+
+interface ModelMeta { label: string; provider: string }
+
+// Deduplicate: the enum has deprecated aliases that map to the same string value
+const ALL_MODEL_IDS: string[] = [...new Set(
+  (Object.values(AI.Model) as unknown[]).filter((v): v is string => typeof v === "string")
+)];
+
+const MODEL_CATALOG: Record<string, ModelMeta> = {};
+for (const id of ALL_MODEL_IDS) {
+  MODEL_CATALOG[id] = { label: makeLabel(id), provider: detectProvider(id) };
+}
+
+const PROVIDER_ORDER = ["OpenAI", "Anthropic", "Google", "xAI", "Mistral", "Together AI", "Perplexity", "Groq", "Other"];
+const PROVIDERS = PROVIDER_ORDER.filter(p =>
+  ALL_MODEL_IDS.some(id => MODEL_CATALOG[id]?.provider === p)
+);
 
 // ─── Persistence keys ─────────────────────────────────────────────────────────
 const KEY_ENABLED        = "bridge_enabled";
 const KEY_SELECTED       = "bridge_selected_models";
 const KEY_AVAILABLE      = "bridge_available_models";
+const KEY_TAILSCALE      = "bridge_tailscale";
+const KEY_TS_PERSIST     = "bridge_tailscale_persist";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function ensureBridgeDir() {
@@ -99,30 +108,67 @@ function readPid(): number | null {
   } catch { return null; }
 }
 
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 function isServerRunning(): boolean {
   const pid = readPid();
   if (!pid) return false;
-  try {
-    process.kill(pid, 0); // signal 0 = existence check, no kill
-    return true;
-  } catch { return false; }
+  return isProcessAlive(pid);
 }
 
 function killServer() {
   const pid = readPid();
   if (!pid) return;
   try { process.kill(pid, "SIGTERM"); } catch {}
+  // Clean up stale PID file
+  try { unlinkSync(PID_FILE); } catch {}
 }
 
-function startServer(port: number) {
+/** HTTP health check — more reliable than PID check */
+function checkServerHealth(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/health`, { timeout: 2000 }, (res) => {
+      let data = "";
+      res.on("data", (c: Buffer) => { data += c; });
+      res.on("end", () => {
+        try {
+          const j = JSON.parse(data);
+          // Update PID file if server reports a different PID
+          if (j.pid) {
+            const currentPid = readPid();
+            if (currentPid !== j.pid) {
+              try { writeFileSync(PID_FILE, String(j.pid)); } catch {}
+            }
+          }
+          resolve(j.status === "ok");
+        } catch { resolve(false); }
+      });
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+  });
+}
+
+function startServer(port: number, bindAddr = "127.0.0.1") {
   ensureBridgeDir();
   writeFileSync(SERVER_JS, SERVER_SCRIPT);
   const child = spawn(process.execPath, [SERVER_JS], {
-    env    : { ...process.env, BRIDGE_PORT: String(port) },
+    env    : { ...process.env, BRIDGE_PORT: String(port), BRIDGE_BIND: bindAddr },
     detached: true,
     stdio  : "ignore",
   });
   child.unref();
+}
+
+function getTailscaleIp(): string | null {
+  try {
+    const out = execSync("tailscale ip -4 2>/dev/null", { encoding: "utf-8", timeout: 3000 }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
 }
 
 function saveSelectedModels(ids: string[]) {
@@ -157,17 +203,25 @@ export default function Command() {
   const [isScanning, setScanning]         = useState(false);
   const [scanProgress, setScanProgress]   = useState("");
   const [loaded, setLoaded]               = useState(false);
+  const [tailscale, setTailscale]         = useState(false);
+  const [tsPersist, setTsPersist]         = useState(false);
+  const [tailscaleIp, setTailscaleIp]     = useState<string | null>(null);
   const scanRef = useRef(false);
 
   // ── Load persisted state ──────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const [en, sel, avail] = await Promise.all([
+      const [en, sel, avail, ts, tsp] = await Promise.all([
         LocalStorage.getItem<string>(KEY_ENABLED),
         LocalStorage.getItem<string>(KEY_SELECTED),
         LocalStorage.getItem<string>(KEY_AVAILABLE),
+        LocalStorage.getItem<string>(KEY_TAILSCALE),
+        LocalStorage.getItem<string>(KEY_TS_PERSIST),
       ]);
       if (en === "true") setIsEnabled(true);
+      if (ts === "true") setTailscale(true);
+      if (tsp === "true") setTsPersist(true);
+      setTailscaleIp(getTailscaleIp());
       if (sel) {
         try { setSelected(new Set(JSON.parse(sel))); } catch {}
       } else {
@@ -177,17 +231,43 @@ export default function Command() {
       if (avail) {
         try { setAvailable(JSON.parse(avail)); } catch {}
       }
-      setServerOk(isServerRunning());
+      // Check server health via HTTP (more reliable than PID)
+      checkServerHealth(port).then(ok => setServerOk(ok));
+      // Always write full model catalog to disk so server can build aliases
+      ensureBridgeDir();
+      writeFileSync(AVAILABLE_MODELS_FILE, JSON.stringify(ALL_MODEL_IDS));
       setLoaded(true);
     })();
   }, []);
 
-  // ── Server health poll while command is open ──────────────────────────────
+  // ── Server health poll with auto-restart ────────────────────────────────
+  const restartingRef = useRef(false);
   useEffect(() => {
     if (!loaded) return;
-    const t = setInterval(() => setServerOk(isServerRunning()), 3_000);
+    const t = setInterval(async () => {
+      const healthy = await checkServerHealth(port);
+      setServerOk(healthy);
+
+      // Auto-restart if bridge is enabled but server is dead
+      if (isEnabled && !healthy && !restartingRef.current) {
+        restartingRef.current = true;
+        // Kill any zombie process
+        killServer();
+        const bind = tailscale ? "0.0.0.0" : "127.0.0.1";
+        startServer(port, bind);
+        // Give it a moment to start
+        setTimeout(async () => {
+          const ok = await checkServerHealth(port);
+          setServerOk(ok);
+          restartingRef.current = false;
+          if (ok) {
+            await showToast({ style: Toast.Style.Success, title: "AI Bridge auto-restarted" });
+          }
+        }, 2000);
+      }
+    }, 3_000);
     return () => clearInterval(t);
-  }, [loaded]);
+  }, [loaded, isEnabled, port, tailscale]);
 
   // ── Toggle bridge on/off ──────────────────────────────────────────────────
   const toggle = useCallback(async () => {
@@ -200,8 +280,15 @@ export default function Command() {
     await LocalStorage.setItem(KEY_ENABLED, String(next));
 
     if (next) {
+      // If persist is off, reset tailscale on restart
+      const useTailscale = tsPersist ? tailscale : false;
+      if (!tsPersist && tailscale) {
+        setTailscale(false);
+        await LocalStorage.setItem(KEY_TAILSCALE, "false");
+      }
+      const bind = useTailscale ? "0.0.0.0" : "127.0.0.1";
       if (!isServerRunning()) {
-        startServer(port);
+        startServer(port, bind);
         await showToast({ style: Toast.Style.Success, title: "AI Bridge started", message: endpointUrl });
       } else {
         await showToast({ style: Toast.Style.Success, title: "AI Bridge enabled", message: endpointUrl });
@@ -214,7 +301,7 @@ export default function Command() {
       setServerOk(false);
       await showToast({ style: Toast.Style.Success, title: "AI Bridge stopped" });
     }
-  }, [isEnabled, port, endpointUrl, selectedModels]);
+  }, [isEnabled, port, endpointUrl, selectedModels, tailscale, tsPersist]);
 
   // ── Scan available models ─────────────────────────────────────────────────
   const scanModels = useCallback(async () => {
@@ -249,6 +336,9 @@ export default function Command() {
     setSelected(new Set(results));
     await LocalStorage.setItem(KEY_AVAILABLE, JSON.stringify(results));
     await LocalStorage.setItem(KEY_SELECTED, JSON.stringify(results));
+    // Write available models to disk so the server can build aliases for all of them
+    ensureBridgeDir();
+    writeFileSync(AVAILABLE_MODELS_FILE, JSON.stringify(ALL_MODEL_IDS));
     saveSelectedModels(results);
 
     toast.style = Toast.Style.Success;
@@ -292,6 +382,48 @@ export default function Command() {
       return next;
     });
   }, []);
+
+  // ── Toggle Tailscale ─────────────────────────────────────────────────────
+  const toggleTailscale = useCallback(async () => {
+    const ip = getTailscaleIp();
+    setTailscaleIp(ip);
+
+    if (!tailscale && !ip) {
+      await showToast({ style: Toast.Style.Failure, title: "Tailscale not found", message: "Install Tailscale or check it's running" });
+      return;
+    }
+
+    const next = !tailscale;
+    setTailscale(next);
+    await LocalStorage.setItem(KEY_TAILSCALE, String(next));
+
+    // Restart server with new bind address if bridge is on
+    if (isEnabled) {
+      killServer();
+      await new Promise(r => setTimeout(r, 500));
+      startServer(port, next ? "0.0.0.0" : "127.0.0.1");
+      await showToast({
+        style: Toast.Style.Success,
+        title: next ? "Tailscale enabled" : "Tailscale disabled",
+        message: next ? `Listening on ${ip}:${port}` : `Listening on localhost:${port}`,
+      });
+    } else {
+      await showToast({
+        style: Toast.Style.Success,
+        title: next ? "Tailscale will be enabled on next start" : "Tailscale disabled",
+      });
+    }
+  }, [tailscale, isEnabled, port]);
+
+  const toggleTsPersist = useCallback(async () => {
+    const next = !tsPersist;
+    setTsPersist(next);
+    await LocalStorage.setItem(KEY_TS_PERSIST, String(next));
+    await showToast({
+      style: Toast.Style.Success,
+      title: next ? "Tailscale persists on restart" : "Tailscale resets on restart",
+    });
+  }, [tsPersist]);
 
   // Always show all models — after scan, verified/unavailable tags indicate status
   const displayModels = ALL_MODEL_IDS;
@@ -349,6 +481,20 @@ export default function Command() {
                     }}
                     shortcut={{ modifiers: ["cmd"], key: "o" }}
                   />
+                  {availableModels.length > 0 && (
+                    <>
+                      <Action.CopyToClipboard
+                        title="Copy Verified Models (comma separated)"
+                        content={availableModels.join(", ")}
+                        shortcut={{ modifiers: ["cmd"], key: "m" }}
+                      />
+                      <Action.CopyToClipboard
+                        title="Copy Verified Models (one per line)"
+                        content={availableModels.join("\n")}
+                        shortcut={{ modifiers: ["cmd", "shift"], key: "m" }}
+                      />
+                    </>
+                  )}
                 </>
               )}
             </ActionPanel>
@@ -373,6 +519,88 @@ export default function Command() {
             }
           />
         )}
+      </List.Section>
+
+      {/* ── Tailscale ── */}
+      <List.Section title="Network">
+        <List.Item
+          icon={{
+            source: tailscale ? Icon.CheckCircle : Icon.Circle,
+            tintColor: tailscale ? Color.Blue : Color.SecondaryText,
+          }}
+          title={tailscale ? "Tailscale: ON" : "Tailscale: OFF"}
+          subtitle={
+            tailscale && tailscaleIp
+              ? `Accessible on Tailnet at ${tailscaleIp}:${port}`
+              : "Enable to expose bridge on your Tailnet"
+          }
+          accessories={
+            tailscale && tailscaleIp
+              ? [{ tag: { value: tailscaleIp, color: Color.Blue } }]
+              : tailscaleIp
+              ? [{ tag: { value: "available", color: Color.SecondaryText } }]
+              : [{ tag: { value: "not detected", color: Color.Red } }]
+          }
+          actions={
+            <ActionPanel>
+              <Action
+                title={tailscale ? "Disable Tailscale" : "Enable Tailscale"}
+                icon={tailscale ? Icon.Stop : Icon.Play}
+                onAction={toggleTailscale}
+              />
+              {tailscale && tailscaleIp && (
+                <>
+                  <Action.CopyToClipboard
+                    title="Copy Tailscale Endpoint"
+                    content={`http://${tailscaleIp}:${port}/v1/chat/completions`}
+                    shortcut={{ modifiers: ["cmd"], key: "t" }}
+                  />
+                  <Action.CopyToClipboard
+                    title="Copy Tailscale Base URL"
+                    content={`http://${tailscaleIp}:${port}`}
+                  />
+                </>
+              )}
+            </ActionPanel>
+          }
+        />
+        {tailscale && tailscaleIp && isEnabled && serverOk && (
+          <List.Item
+            icon={{ source: Icon.Link, tintColor: Color.Blue }}
+            title={`http://${tailscaleIp}:${port}/v1/chat/completions`}
+            subtitle="Tailscale endpoint — paste ready"
+            accessories={[{ icon: Icon.Clipboard, tooltip: "Cmd+C to copy" }]}
+            actions={
+              <ActionPanel>
+                <Action.CopyToClipboard
+                  title="Copy Tailscale Endpoint"
+                  content={`http://${tailscaleIp}:${port}/v1/chat/completions`}
+                />
+              </ActionPanel>
+            }
+          />
+        )}
+        <List.Item
+          icon={{
+            source: tsPersist ? Icon.CheckCircle : Icon.Circle,
+            tintColor: tsPersist ? Color.Green : Color.SecondaryText,
+          }}
+          title={tsPersist ? "Persist on restart: ON" : "Persist on restart: OFF"}
+          subtitle={
+            tsPersist
+              ? "Tailscale stays enabled when bridge restarts"
+              : "Tailscale resets to OFF when bridge restarts"
+          }
+          actions={
+            <ActionPanel>
+              <Action
+                title={tsPersist ? "Disable Persist" : "Enable Persist"}
+                icon={tsPersist ? Icon.XMarkCircle : Icon.CheckCircle}
+                onAction={toggleTsPersist}
+              />
+            </ActionPanel>
+          }
+        />
       </List.Section>
 
       {/* ── Model Scanner ── */}

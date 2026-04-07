@@ -7,7 +7,6 @@ export const SERVER_SCRIPT = /* js */ `
 'use strict';
 const http = require('http');
 const fs   = require('fs');
-const { exec } = require('child_process');
 const path = require('path');
 const os   = require('os');
 
@@ -16,62 +15,73 @@ const REQ_FILE    = path.join(BRIDGE_DIR, 'request.json');
 const RESP_FILE   = path.join(BRIDGE_DIR, 'response.json');
 const PID_FILE    = path.join(BRIDGE_DIR, 'server.pid');
 const PORT        = parseInt(process.env.BRIDGE_PORT || '3099', 10);
-const TIMEOUT_MS  = 90_000;
-const POLL_MS     = 150;
+const BIND_ADDR   = process.env.BRIDGE_BIND || '127.0.0.1';
+const TIMEOUT_MS  = 180_000;
+const POLL_MS     = 80;
 
-// Deep-link that triggers the process command inside Raycast
-const DEEP_LINK = 'raycast://extensions/seancrooks/ai-bridge/process';
 
-// Alias map: droid sends "ray/*" names, bridge translates to Raycast model IDs
-const MODEL_ALIASES = {
-  'ray/gpt-4o':          'openai-gpt-4o',
-  'ray/gpt-4o-mini':     'openai-gpt-4o-mini',
-  'ray/gpt-4.1':         'openai-gpt-4.1',
-  'ray/gpt-4.1-mini':    'openai-gpt-4.1-mini',
-  'ray/gpt-4.1-nano':    'openai-gpt-4.1-nano',
-  'ray/o1':              'openai_o1-o1',
-  'ray/o3':              'openai_o1-o3',
-  'ray/o3-mini':         'openai_o1-o3-mini',
-  'ray/o4-mini':         'openai_o1-o4-mini',
-  'ray/claude-3.5-haiku':   'anthropic-claude-haiku-3-5',
-  'ray/claude-3.5-sonnet':  'anthropic-claude-sonnet-3-5',
-  'ray/claude-sonnet-4':    'anthropic-claude-sonnet-4',
-  'ray/claude-4.5-sonnet':  'anthropic-claude-sonnet-4-5',
-  'ray/claude-4.6-sonnet':  'anthropic-claude-sonnet-4-6',
-  'ray/claude-opus-4':      'anthropic-claude-opus-4',
-  'ray/claude-4.5-opus':    'anthropic-claude-opus-4-5',
-  'ray/claude-4.6-opus':    'anthropic-claude-opus-4-6',
-  'ray/gemini-2.0-flash':     'google-gemini-2.0-flash',
-  'ray/gemini-2.5-flash':     'google-gemini-2.5-flash',
-  'ray/gemini-2.5-flash-lite':'google-gemini-2.5-flash-lite',
-  'ray/gemini-2.5-pro':       'google-gemini-2.5-pro',
-  'ray/grok-3':          'xai-grok-3',
-  'ray/grok-3-mini':     'xai-grok-3-mini',
-  'ray/grok-4':          'xai-grok-4',
-  'ray/grok-4-fast':     'xai-grok-4-fast',
-  'ray/codestral':       'mistral-codestral-latest',
-  'ray/mistral-large':   'mistral-mistral-large-latest',
-  'ray/mistral-medium':  'mistral-mistral-medium-latest',
-  'ray/mistral-small':   'mistral-mistral-small-latest',
-  'ray/deepseek-r1':     'together-deepseek-ai/DeepSeek-R1',
-  'ray/deepseek-v3':     'together-deepseek-ai/DeepSeek-V3',
-  'ray/kimi-k2.5':       'together-moonshotai/Kimi-K2.5',
-  'ray/sonar':           'perplexity-sonar',
-  'ray/sonar-pro':       'perplexity-sonar-pro',
-  'ray/llama-3.3-70b':   'groq-llama-3.3-70b-versatile',
-  'ray/llama-3.1-8b':    'groq-llama-3.1-8b-instant',
-  'ray/llama-4-scout':   'groq-meta-llama/llama-4-scout-17b-16e-instruct',
-  'ray/kimi-k2':         'groq-moonshotai/kimi-k2-instruct',
-  'ray/qwen3-32b':       'groq-qwen/qwen3-32b',
-};
+// Auto-generate alias map so any ray/* name resolves to a Raycast model ID.
+// Reads both selected-models.json AND available-models.json to cover everything.
+// Droid sends "ray/<short-name>", bridge translates to full Raycast model ID.
+function buildAliases() {
+  const aliases = {};
+  // Read ALL known model IDs (selected + available + any we've seen)
+  const sources = ['selected-models.json', 'available-models.json'];
+  const allIds = new Set();
+  for (const file of sources) {
+    try {
+      const arr = JSON.parse(fs.readFileSync(path.join(BRIDGE_DIR, file), 'utf-8'));
+      arr.forEach(id => allIds.add(id));
+    } catch {}
+  }
+
+  const PREFIXES = [
+    ['openai_o1-', 'OpenAI'],
+    ['openai-',    'OpenAI'],
+    ['anthropic-', 'Anthropic'],
+    ['google-',    'Google'],
+    ['xai-',       'xAI'],
+    ['mistral-',   'Mistral'],
+    ['together-',  'Together'],
+    ['perplexity-','Perplexity'],
+    ['groq-',      'Groq'],
+  ];
+
+  for (const id of allIds) {
+    // Generate ray/<short> alias by stripping the provider prefix
+    for (const [prefix] of PREFIXES) {
+      if (id.startsWith(prefix)) {
+        let shortName = id.slice(prefix.length);
+        // Clean up org prefixes (e.g. "deepseek-ai/DeepSeek-R1" → "DeepSeek-R1")
+        if (shortName.includes('/')) shortName = shortName.split('/').pop();
+        // Remove common suffixes for cleaner aliases
+        const cleaned = shortName.replace(/-latest$/, '').replace(/-versatile$/, '').replace(/-instant$/, '');
+        // Register BOTH the cleaned alias and the full short name to avoid collisions
+        aliases['ray/' + cleaned.toLowerCase()] = id;
+        if (cleaned !== shortName) {
+          aliases['ray/' + shortName.toLowerCase()] = id;
+        }
+        break;
+      }
+    }
+    // Also allow the raw model ID as-is
+    aliases[id] = id;
+  }
+  return aliases;
+}
+
+const MODEL_ALIASES = buildAliases();
 
 function resolveModel(name) {
+  // Support both ray/ and rb/ prefixes (rb = raycast-bridge, avoids droid's provider detection)
+  if (name.startsWith('rb/')) {
+    const rayName = 'ray/' + name.slice(3);
+    if (MODEL_ALIASES[rayName]) return MODEL_ALIASES[rayName];
+  }
   return MODEL_ALIASES[name] || name;
 }
 
-function triggerRaycast() {
-  exec('open "' + DEEP_LINK + '"', () => {});
-}
+// No triggerRaycast needed — the menu-bar command polls for request.json automatically
 
 function waitForResponse(id, resolve, reject) {
   const deadline = Date.now() + TIMEOUT_MS;
@@ -170,7 +180,7 @@ const server = http.createServer((req, res) => {
 
       const wantStream = !!data.stream;
 
-      triggerRaycast();
+      // Menu-bar command polls for request.json — no trigger needed
 
       if (wantStream) {
         // ── SSE streaming mode ──────────────────────────────────────────
@@ -215,6 +225,14 @@ const server = http.createServer((req, res) => {
                 busy = false;
 
                 if (respData.error) {
+                  // Send error as visible content so the user sees it
+                  res.write('data: ' + JSON.stringify({
+                    id: 'chatcmpl-' + id,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: request.model,
+                    choices: [{ index: 0, delta: { content: '[Bridge Error] ' + respData.error }, finish_reason: null }],
+                  }) + NL2);
                   res.write('data: ' + JSON.stringify({
                     id: 'chatcmpl-' + id,
                     object: 'chat.completion.chunk',
@@ -298,9 +316,9 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: 'Not found', type: 'not_found' } }));
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, BIND_ADDR, () => {
   try { fs.writeFileSync(PID_FILE, process.pid.toString()); } catch {}
-  console.log('[AI Bridge] Listening on http://127.0.0.1:' + PORT);
+  console.log('[AI Bridge] Listening on http://' + BIND_ADDR + ':' + PORT);
 });
 
 process.on('SIGTERM', () => { server.close(); process.exit(0); });
