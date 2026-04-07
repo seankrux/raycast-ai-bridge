@@ -293,9 +293,9 @@ export default function Command() {
     });
   }, []);
 
-  // ── Render lists of models filtered to those that are "known available" or all ──
-  // If scan has run → show only available models.  If not → show full catalog.
-  const displayModels = availableModels.length > 0 ? availableModels : ALL_MODEL_IDS;
+  // Always show all models — after scan, verified/unavailable tags indicate status
+  const displayModels = ALL_MODEL_IDS;
+  const hasScanResults = availableModels.length > 0;
 
   if (!loaded) return <List isLoading />;
 
@@ -445,10 +445,10 @@ export default function Command() {
                   title={meta?.label ?? id}
                   subtitle={id}
                   accessories={[
-                    ...(availableModels.includes(id)
-                      ? [{ tag: { value: "verified", color: Color.Green } }]
-                      : availableModels.length > 0
-                      ? [{ tag: { value: "not available", color: Color.Red } }]
+                    ...(hasScanResults
+                      ? availableModels.includes(id)
+                        ? [{ tag: { value: "verified", color: Color.Green } }]
+                        : [{ tag: { value: "not available", color: Color.Red } }]
                       : []
                     ),
                   ]}
