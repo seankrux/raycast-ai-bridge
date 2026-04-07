@@ -7,18 +7,25 @@
 
 /* eslint-disable @typescript-eslint/ban-types */
 
-type ExtensionPreferences = {}
+type ExtensionPreferences = {
+  /** HTTP Port - Local port the bridge server listens on (default 3099) */
+  "port": string
+}
 
 /** Preferences accessible in all the extension's commands */
 declare type Preferences = ExtensionPreferences
 
 declare namespace Preferences {
-  /** Preferences accessible in the `ai-bridge` command */
-  export type AiBridge = ExtensionPreferences & {}
+  /** Preferences accessible in the `manage` command */
+  export type Manage = ExtensionPreferences & {}
+  /** Preferences accessible in the `process` command */
+  export type Process = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
-  /** Arguments passed to the `ai-bridge` command */
-  export type AiBridge = {}
+  /** Arguments passed to the `manage` command */
+  export type Manage = {}
+  /** Arguments passed to the `process` command */
+  export type Process = {}
 }
 

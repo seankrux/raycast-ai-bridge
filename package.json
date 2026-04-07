@@ -1,17 +1,37 @@
 {
   "name": "ai-bridge",
   "title": "AI Bridge",
-  "description": "Bridge Raycast AI to CLI via file-based IPC",
+  "description": "Expose Raycast AI as a local OpenAI-compatible HTTP endpoint",
   "icon": "command-icon.png",
   "author": "seancrooks",
   "categories": ["Developer Tools"],
   "license": "MIT",
   "commands": [
     {
-      "name": "ai-bridge",
-      "title": "AI Bridge",
-      "description": "Watches for AI requests and returns responses via file IPC",
-      "mode": "no-view"
+      "name": "manage",
+      "title": "AI Bridge — Manage",
+      "subtitle": "Toggle · Models · Endpoint URL",
+      "description": "Turn the bridge on/off, scan available AI models, select which to expose, and copy the endpoint URL.",
+      "mode": "view",
+      "icon": "command-icon.png"
+    },
+    {
+      "name": "process",
+      "title": "AI Bridge — Process Request",
+      "description": "Processes a pending AI request from the HTTP server. Triggered automatically via deep link.",
+      "mode": "no-view",
+      "icon": "command-icon.png"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "port",
+      "title": "HTTP Port",
+      "description": "Local port the bridge server listens on (default 3099)",
+      "type": "textfield",
+      "required": false,
+      "default": "3099",
+      "placeholder": "3099"
     }
   ],
   "dependencies": {
