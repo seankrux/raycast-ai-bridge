@@ -127,16 +127,45 @@ const CORS = {
 
 const JSON_HEADERS = { ...CORS, 'Content-Type': 'application/json' };
 
+// ── Request queue — serializes requests instead of rejecting with 429 ──
+const MAX_QUEUE = 10;
+const queue = [];       // Array of { resolve } — waiters for their turn
 let busy = false;
 let busySince = 0;
-const BUSY_TIMEOUT = 180_000; // auto-release busy after 3 min
+const BUSY_TIMEOUT = 180_000;
 
-const server = http.createServer((req, res) => {
-  // Auto-release stuck busy flag
+function acquireLock() {
+  // Auto-release stuck lock
   if (busy && Date.now() - busySince > BUSY_TIMEOUT) {
     busy = false;
+    // Drain stale request file
+    try { fs.unlinkSync(REQ_FILE); } catch {}
   }
+  if (!busy) {
+    busy = true;
+    busySince = Date.now();
+    return Promise.resolve();
+  }
+  // Wait in queue
+  return new Promise((resolve, reject) => {
+    if (queue.length >= MAX_QUEUE) {
+      return reject(new Error('Queue full (' + MAX_QUEUE + ' waiting)'));
+    }
+    queue.push({ resolve });
+  });
+}
 
+function releaseLock() {
+  if (queue.length > 0) {
+    const next = queue.shift();
+    busySince = Date.now();
+    next.resolve(); // hand lock to next waiter
+  } else {
+    busy = false;
+  }
+}
+
+const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
     return res.end();
@@ -144,7 +173,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, JSON_HEADERS);
-    return res.end(JSON.stringify({ status: 'ok', port: PORT, pid: process.pid, busy }));
+    return res.end(JSON.stringify({ status: 'ok', port: PORT, pid: process.pid, busy, queued: queue.length }));
   }
 
   if (req.method === 'GET' && req.url === '/v1/models') {
@@ -158,11 +187,6 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'POST' && (req.url === '/v1/chat/completions' || req.url === '/chat/completions')) {
-    if (busy) {
-      res.writeHead(429, JSON_HEADERS);
-      return res.end(JSON.stringify({ error: { message: 'Bridge busy — one request at a time', type: 'rate_limit' } }));
-    }
-
     let body = '';
     req.on('data', c => { body += c; });
     req.on('end', () => {
@@ -190,148 +214,147 @@ const server = http.createServer((req, res) => {
         system    : systemMsg ? (typeof systemMsg.content === 'string' ? systemMsg.content : '') : undefined,
       };
 
-      busy = true;
-      busySince = Date.now();
-      try {
-        fs.writeFileSync(REQ_FILE, JSON.stringify(request));
-      } catch (e) {
-        busy = false;
-        res.writeHead(500, JSON_HEADERS);
-        return res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
-      }
-
-      const wantStream = !!data.stream;
-
-      if (wantStream) {
-        res.writeHead(200, {
-          ...CORS,
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        });
-        res.flushHeaders();
-
-        const NL2 = String.fromCharCode(10) + String.fromCharCode(10);
-        let lastLen = 0;
-        const deadline = Date.now() + TIMEOUT_MS;
-        let done = false;
-
-        // Client disconnect — release busy (listen on res, not req)
-        res.on('close', () => {
-          if (!done) { finish(); busy = false; }
-        });
-
-        // Use fs.watch for stream file changes too
-        let streamWatcher = null;
+      // Acquire lock (waits in queue if busy)
+      acquireLock().then(() => {
         try {
-          streamWatcher = fs.watch(BRIDGE_DIR, (_, filename) => {
-            if (done) return;
-            if (filename === 'stream.txt') emitDelta();
-            if (filename === 'response.json') checkDone();
+          fs.writeFileSync(REQ_FILE, JSON.stringify(request));
+        } catch (e) {
+          releaseLock();
+          res.writeHead(500, JSON_HEADERS);
+          return res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+        }
+
+        const wantStream = !!data.stream;
+
+        if (wantStream) {
+          res.writeHead(200, {
+            ...CORS,
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
           });
-          streamWatcher.on('error', () => {});
-        } catch {}
+          res.flushHeaders();
 
-        const emitDelta = () => {
+          const NL2 = String.fromCharCode(10) + String.fromCharCode(10);
+          let lastLen = 0;
+          const deadline = Date.now() + TIMEOUT_MS;
+          let done = false;
+
+          res.on('close', () => {
+            if (!done) { finish(); releaseLock(); }
+          });
+
+          let streamWatcher = null;
           try {
-            const content = fs.readFileSync(STREAM_FILE, 'utf-8');
-            if (content.length > lastLen) {
-              const delta = content.slice(lastLen);
-              lastLen = content.length;
-              res.write('data: ' + JSON.stringify({
-                id: 'chatcmpl-' + id,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: request.model,
-                choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-              }) + NL2);
-            }
+            streamWatcher = fs.watch(BRIDGE_DIR, (_, filename) => {
+              if (done) return;
+              if (filename === 'stream.txt') emitDelta();
+              if (filename === 'response.json') checkDone();
+            });
+            streamWatcher.on('error', () => {});
           } catch {}
-        };
 
-        const finish = () => {
-          if (done) return;
-          done = true;
-          if (streamWatcher) { try { streamWatcher.close(); } catch {} }
-          clearInterval(fallbackTimer);
-        };
+          const emitDelta = () => {
+            try {
+              const content = fs.readFileSync(STREAM_FILE, 'utf-8');
+              if (content.length > lastLen) {
+                const delta = content.slice(lastLen);
+                lastLen = content.length;
+                res.write('data: ' + JSON.stringify({
+                  id: 'chatcmpl-' + id,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: request.model,
+                  choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                }) + NL2);
+              }
+            } catch {}
+          };
 
-        const checkDone = () => {
-          try {
-            const respData = JSON.parse(fs.readFileSync(RESP_FILE, 'utf-8'));
-            if (respData.id !== id) return;
-            finish();
-            try { fs.unlinkSync(RESP_FILE); } catch {}
-            busy = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            if (streamWatcher) { try { streamWatcher.close(); } catch {} }
+            clearInterval(fallbackTimer);
+          };
 
-            if (respData.error) {
+          const checkDone = () => {
+            try {
+              const respData = JSON.parse(fs.readFileSync(RESP_FILE, 'utf-8'));
+              if (respData.id !== id) return;
+              finish();
+              try { fs.unlinkSync(RESP_FILE); } catch {}
+              releaseLock();
+
+              if (respData.error) {
+                res.write('data: ' + JSON.stringify({
+                  id: 'chatcmpl-' + id, object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000), model: request.model,
+                  choices: [{ index: 0, delta: { content: '[Bridge Error] ' + respData.error }, finish_reason: null }],
+                }) + NL2);
+              } else {
+                emitDelta();
+              }
               res.write('data: ' + JSON.stringify({
                 id: 'chatcmpl-' + id, object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000), model: request.model,
-                choices: [{ index: 0, delta: { content: '[Bridge Error] ' + respData.error }, finish_reason: null }],
+                created: Math.floor(Date.now() / 1000), model: respData.model || request.model,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
               }) + NL2);
-            } else {
-              // Flush remaining stream content
-              emitDelta();
+              res.write('data: [DONE]' + NL2);
+              res.end();
+            } catch {}
+          };
+
+          const fallbackTimer = setInterval(() => {
+            if (done) return;
+            if (Date.now() > deadline) {
+              finish();
+              releaseLock();
+              res.write('data: [DONE]' + NL2);
+              res.end();
+              return;
             }
-            res.write('data: ' + JSON.stringify({
-              id: 'chatcmpl-' + id, object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000), model: respData.model || request.model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            }) + NL2);
-            res.write('data: [DONE]' + NL2);
-            res.end();
-          } catch {}
-        };
+            emitDelta();
+            checkDone();
+          }, 250);
 
-        // Fallback poll — only needed if fs.watch misses events, so use slower interval
-        const fallbackTimer = setInterval(() => {
-          if (done) return;
-          if (Date.now() > deadline) {
-            finish();
-            busy = false;
-            res.write('data: [DONE]' + NL2);
-            res.end();
-            return;
-          }
-          emitDelta();
-          checkDone();
-        }, 250);
+        } else {
+          res.on('close', () => { releaseLock(); });
 
-      } else {
-        // Client disconnect — release busy
-        let clientGone = false;
-        res.on('close', () => { clientGone = true; busy = false; });
-
-        waitForResponse(id, TIMEOUT_MS).then(
-          (resp) => {
-            busy = false;
-            if (resp.error) {
-              res.writeHead(500, JSON_HEADERS);
-              res.end(JSON.stringify({ error: { message: resp.error, type: 'bridge_error' } }));
-            } else {
-              res.writeHead(200, JSON_HEADERS);
-              res.end(JSON.stringify({
-                id     : 'chatcmpl-' + id,
-                object : 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model  : resp.model,
-                choices: [{
-                  index        : 0,
-                  message      : { role: 'assistant', content: resp.content },
-                  finish_reason: 'stop',
-                }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-              }));
+          waitForResponse(id, TIMEOUT_MS).then(
+            (resp) => {
+              releaseLock();
+              if (resp.error) {
+                res.writeHead(500, JSON_HEADERS);
+                res.end(JSON.stringify({ error: { message: resp.error, type: 'bridge_error' } }));
+              } else {
+                res.writeHead(200, JSON_HEADERS);
+                res.end(JSON.stringify({
+                  id     : 'chatcmpl-' + id,
+                  object : 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model  : resp.model,
+                  choices: [{
+                    index        : 0,
+                    message      : { role: 'assistant', content: resp.content },
+                    finish_reason: 'stop',
+                  }],
+                  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                }));
+              }
+            },
+            (err) => {
+              releaseLock();
+              res.writeHead(504, JSON_HEADERS);
+              res.end(JSON.stringify({ error: { message: err.message, type: 'timeout' } }));
             }
-          },
-          (err) => {
-            busy = false;
-            res.writeHead(504, JSON_HEADERS);
-            res.end(JSON.stringify({ error: { message: err.message, type: 'timeout' } }));
-          }
-        );
-      }
+          );
+        }
+      }, (err) => {
+        // acquireLock rejected — queue full
+        res.writeHead(429, JSON_HEADERS);
+        res.end(JSON.stringify({ error: { message: err.message, type: 'rate_limit' } }));
+      });
     });
     return;
   }
